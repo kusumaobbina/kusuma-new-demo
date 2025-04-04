@@ -1,0 +1,58 @@
+    1  git clone https://github.com/kusumaobbina/kusuma-new-demo.git
+    2  git checkout develop
+    3  cd kusuma-new-demo/
+    4  git checkout -b test
+    5  git push
+    6  git push --set-upstream origin test
+    7  git add README.md 
+    8  git status
+    9  git commit -m "commit 2"
+   10  git push
+   11  git switch develop
+   12  git add README.md 
+   13  git commit -m "commit 3"
+   14  git push
+   15  git pull
+   16  git checkout test
+   17  git merge master
+   18  git merge master test
+   19  git branches
+   20  git branch
+   21  git branch -a
+   22  git pull
+   23  git checkout master
+   24  git pull
+   25  git checkout test
+   26  git merge master
+   27  git status
+   28  git stash 
+   29  git merge master
+   30  git add README.md 
+   31  git commit -m "commit 4"
+   32  git status
+   33  git switch master
+   34  git merge test
+   35  git log -all-oneline
+   36  git log -oneline
+   37  git log --oneline
+   38  git reset HEAD~1
+   39  git stash
+   40  git checkout -b staging
+   41  git checkout master 
+   42  git merge test
+   43  git checkout staging 
+   44  git add 
+   45  git add .
+   46  git commit -m "commit 5"
+   47  git checkout master
+   48  git merge staging
+   49  git status
+   50  git add README.md 
+   51  git add --README.md
+   52  git add -- README.md
+   53  git status
+   54  git status
+   55  git status
+   56  git merge --continue
+   57  git log --oneline
+   58  history > commands.txt
