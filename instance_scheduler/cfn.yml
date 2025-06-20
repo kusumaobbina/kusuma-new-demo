@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Central EC2 Scheduler with robust tagging, scheduling, and DLQ handling.
+
+Parameters:
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket containing Lambda zip files.
+
+  LambdaS3Key:
+    Type: String
+    Description: S3 key to the Lambda zip (same for both functions).
+
+Resources:
+
+  CentralEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: InstanceSchedulerCentralBus
+
+  CentralEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      Action: "events:PutEvents"
+      Principal: "*"
+      StatementId: AllowOrgToPutEvents
+      EventBusName: !Ref CentralEventBus
+      Condition:
+        Key: aws:PrincipalOrgID
+        Type: StringEquals
+        Value: o-i45gk07tmd
+
+  InstanceSchedulerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: InstanceSchedulerTable
+      AttributeDefinitions:
+        - AttributeName: InstanceId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: InstanceId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  InstanceSchedulerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: InstanceSchedulerQueue
+
+  InstanceSchedulerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: InstanceSchedulerDLQ
+
+  StreamProcessorDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: StreamProcessorDLQ
+
+  InstanceSchedulerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref InstanceSchedulerQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt InstanceSchedulerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt EventBusToSQSRule.Arn
+
+  MyEventBridgeInvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: MyEventBridgeInvokeLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: '*'
+
+  EventBusToSQSRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InstanceSchedulerEventBusToSQSRule
+      EventBusName: !Ref CentralEventBus
+      EventPattern:
+        source:
+          - aws.ec2
+          - ec2
+        detail-type:
+          - EC2 Instance State-change Notification
+          - AWS API Call via CloudTrail
+      Targets:
+        - Arn: !GetAtt InstanceSchedulerQueue.Arn
+          Id: SQSQueueTarget
+
+  InstanceTaggingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InstanceTaggingRule
+      ScheduleExpression: cron(0,30 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WorkerLambdaFunction.Arn
+          Id: TagTarget
+          RoleArn: !GetAtt MyEventBridgeInvokeLambdaRole.Arn
+
+  TagConsistencyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InstanceTagConsistencyRule
+      ScheduleExpression: cron(15,45 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WorkerLambdaFunction.Arn
+          Id: TagConsistencyTarget
+          RoleArn: !GetAtt MyEventBridgeInvokeLambdaRole.Arn
+
+  SchedulerRecheckRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: InstanceSchedulerRecheckRule
+      ScheduleExpression: cron(10,40 * * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt StreamProcessorLambdaFunction.Arn
+          Id: SchedulerRecheckTarget
+          RoleArn: !GetAtt MyEventBridgeInvokeLambdaRole.Arn
+
+  WorkerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: InstanceSchedulerWorkerLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WorkerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Scan]
+                Resource: !GetAtt InstanceSchedulerTable.Arn
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt InstanceSchedulerQueue.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt InstanceSchedulerDLQ.Arn
+              - Effect: Allow
+                Action: logs:*
+                Resource: '*'
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt CentralEventBus.Arn
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: arn:aws:iam::*:role/EC2SchedulerRole
+
+  StreamProcessorLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StreamProcessorLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StreamProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: !GetAtt InstanceSchedulerTable.StreamArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt InstanceSchedulerTable.Arn
+              - Effect: Allow
+                Action: [ec2:StartInstances, ec2:StopInstances, ec2:DescribeInstances]
+                Resource: '*'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt StreamProcessorDLQ.Arn
+              - Effect: Allow
+                Action: logs:*
+                Resource: '*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: arn:aws:iam::*:role/EC2SchedulerRole
+
+  WorkerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: InstanceSchedulerWorkerLambda
+      Runtime: python3.9
+      Handler: worker_lambda.worker_lambda.lambda_handler
+      Role: !GetAtt WorkerLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          DDB_TABLE_NAME: !Ref InstanceSchedulerTable
+          ORG_MEMBER_ROLE_NAME: EC2SchedulerRole
+          SQS_QUEUE_URL: !Ref InstanceSchedulerQueue
+          EVENT_BUS_NAME: !Ref CentralEventBus
+      Timeout: 30
+      DeadLetterConfig:
+        TargetArn: !GetAtt InstanceSchedulerDLQ.Arn
+
+  StreamProcessorLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: InstanceSchedulerStreamProcessorLambda
+      Runtime: python3.9
+      Handler: stream_processor_lambda.stream_processor_lambda.lambda_handler
+      Role: !GetAtt StreamProcessorLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          DDB_TABLE_NAME: !Ref InstanceSchedulerTable
+      Timeout: 30
+      DeadLetterConfig:
+        TargetArn: !GetAtt StreamProcessorDLQ.Arn
+
+  WorkerLambdaSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt InstanceSchedulerQueue.Arn
+      FunctionName: !Ref WorkerLambdaFunction
+      Enabled: true
+
+  DDBStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt InstanceSchedulerTable.StreamArn
+      FunctionName: !Ref StreamProcessorLambdaFunction
+      StartingPosition: TRIM_HORIZON
+      Enabled: true
+
+Outputs:
+  EventBusArn:
+    Value: !GetAtt CentralEventBus.Arn
+    Description: ARN of central EventBridge bus
+
+  DynamoDBTableName:
+    Value: !Ref InstanceSchedulerTable
+
+  WorkerLambdaArn:
+    Value: !GetAtt WorkerLambdaFunction.Arn
+
+  StreamProcessorLambdaArn:
+    Value: !GetAtt StreamProcessorLambdaFunction.Arn

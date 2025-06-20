@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  StackSet template for member accounts to deploy IAM role and EventBridge rule
+  to forward EC2 events to a central EventBridge bus in the management account.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: AWS Account ID of centralized (management) account
+
+  CentralEventBusArn:
+    Type: String
+    Description: ARN of the centralized EventBridge bus
+
+Resources:
+
+  EC2SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2SchedulerRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${CentralAccountId}:root
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2SchedulerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:CreateTags
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: "*"
+
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeForwardingRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowPutEventsToCentralBus
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Ref CentralEventBusArn
+
+  EC2EventForwardingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: EC2ForwardToCentralBus
+      EventPattern:
+        source:
+          - aws.ec2
+          - ec2
+        detail-type:
+          - "EC2 Instance State-change Notification"
+          - "AWS API Call via CloudTrail" 
+      State: ENABLED
+      Targets:
+        - Id: ForwardToCentralBus
+          Arn: !Ref CentralEventBusArn
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+
+Outputs:
+  EC2SchedulerRoleArn:
+    Description: ARN of the EC2Scheduler IAM Role
+    Value: !GetAtt EC2SchedulerRole.Arn
+
+  EventBridgeInvokeRoleArn:
+    Description: ARN of the EventBridge forwarding role
+    Value: !GetAtt EventBridgeInvokeRole.Arn
