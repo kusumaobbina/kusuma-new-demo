@@ -1,86 +1,138 @@
 import os
-import json
-# Set environment variables if needed (optional)
-os.environ['DDB_TABLE_NAME'] = 'InstanceSchedulerTable'
-os.environ['ORG_MEMBER_ROLE_NAME'] = 'EC2SchedulerRole'
-import pytest
 from unittest.mock import patch, MagicMock
-import stream_processor_lambda  # your lambda file
+# from datetime import datetime, timedelta, timezone
+from freezegun import freeze_time
+# Patch environment variables
+os.environ['DDB_TABLE_NAME'] = 'TestTable'
+os.environ['ORG_MEMBER_ROLE_NAME'] = 'EC2SchedulerRole'
+os.environ['SQS_QUEUE_URL'] = 'https://sqs.eu-west-1.amazonaws.com/123456789012/InstanceSchedulerQueue'
+os.environ['EVENT_BUS_NAME'] = 'InstanceSchedulerCentralBus'
+
+import stream_processor_lambda as processor
 
 
-
-@pytest.fixture
-def dynamodb_stream_event():
+def get_mock_ddb(last_updated_minutes_ago=10):
+    # last_updated_time = (datetime.now(timezone.utc) - timedelta(minutes=last_updated_minutes_ago)).isoformat()
     return {
-        "Records": [
-            {
-                "eventName": "INSERT",
-                "dynamodb": {
-                    "NewImage": {
-                        "InstanceId": {"S": "i-1234567890abcdef0"},
-                        "AccountId": {"S": "123456789012"},
-                        "Tags": {"M": {"Schedule": {"S": "start=08:00;stop=20:00"}}}
-                    }
-                }
+        'InstanceId': 'i-running-after-hours',
+        'AccountId': '123456789012',
+        'State': 'running',
+        'Tags': {'AutoStart': '06:00', 'AutoStop': '20:00', 'platform': 'dev'},
+        'LastUpdated': '20:00'
+    }
+
+# Existing tests here...
+
+
+@freeze_time("2025-06-21 6:01:00", tz_offset=0)
+@patch('stream_processor_lambda.table')
+def test_start_instance_overnight_window(mock_table):
+    mock_ec2 = MagicMock()
+    # Overnight schedule: start 20:00, stop 06:00
+    tags = {'AutoStart': '06:00', 'AutoStop': '20:00'}
+
+    # Instance stopped at 21:00 (inside overnight "office hours")
+    processor.take_instance_action(
+        ec2_client=mock_ec2,
+        instance_id="i-overnight-start",
+        tags=tags,
+        current_state="stopped",
+        ddb_item=get_mock_ddb(10)
+    )
+    mock_ec2.start_instances.assert_called_once_with(InstanceIds=['i-overnight-start'])
+    mock_ec2.stop_instances.assert_not_called()
+
+
+
+
+@freeze_time("2025-06-21 20:01:00", tz_offset=0)
+@patch('stream_processor_lambda.table')
+def test_stop_instance_overnight_window(mock_table):
+    mock_ec2 = MagicMock()
+    tags = {'AutoStart': '06:00', 'AutoStop': '20:00'}
+
+
+    processor.take_instance_action(
+        ec2_client=mock_ec2,
+        instance_id="i-overnight-stop",
+        tags=tags,
+        current_state="running",
+        ddb_item=get_mock_ddb(10)  # Last updated 10 minutes ago
+    )
+
+    mock_ec2.stop_instances.assert_called_once_with(InstanceIds=['i-overnight-stop'])
+    mock_ec2.start_instances.assert_not_called()
+
+
+@freeze_time("2025-06-21 12:00:00", tz_offset=0)
+@patch('stream_processor_lambda.table')
+def test_invalid_tags_no_action(mock_table):
+    mock_ec2 = MagicMock()
+    tags = {'AutoStart': 'invalid', 'AutoStop': None}
+
+    processor.take_instance_action(
+        ec2_client=mock_ec2,
+        instance_id="i-invalid-tags",
+        tags=tags,
+        current_state="stopped",
+        ddb_item=get_mock_ddb(10)
+    )
+    mock_ec2.start_instances.assert_not_called()
+    mock_ec2.stop_instances.assert_not_called()
+
+
+@patch('stream_processor_lambda.table')
+def test_process_stream_record_terminates_instance(mock_table):
+    mock_table.delete_item = MagicMock()
+    # DynamoDB REMOVE event with terminated instance
+    record = {
+        'eventName': 'REMOVE',
+        'dynamodb': {
+            'OldImage': {
+                'InstanceId': {'S': 'i-terminated'}
             }
-        ]
+        }
     }
+    processor.process_stream_record(record)
+    mock_table.delete_item.assert_called_once_with(Key={'InstanceId': 'i-terminated'})
 
-@patch('stream_processor_lambda.boto3.client')
+
 @patch('stream_processor_lambda.assume_role')
-@patch('stream_processor_lambda.should_start_stop')
-def test_process_record_starts_instance(mock_should_start_stop, mock_assume_role, mock_boto_client, dynamodb_stream_event):
-    # Mock schedule evaluation to say "should start"
-    mock_should_start_stop.return_value = (True, False)  # start=True, stop=False
-
-    # Mock assume_role to return a fake EC2 client
-    mock_ec2 = MagicMock()
-    mock_assume_role.return_value = mock_ec2
-
-    # Mock describe_instances to say instance is stopped
-    mock_ec2.describe_instances.return_value = {
-        'Reservations': [{'Instances': [{'State': {'Name': 'stopped'}}]}]
+@patch('stream_processor_lambda.take_instance_action')
+def test_process_stream_record_skips_missing_platform(mock_take_action, mock_assume_role):
+    mock_take_action.reset_mock()
+    mock_assume_role.return_value = MagicMock()
+    # DynamoDB INSERT event without 'platform' tag
+    record = {
+        'eventName': 'INSERT',
+        'dynamodb': {
+            'NewImage': {
+                'InstanceId': {'S': 'i-123'},
+                'AccountId': {'S': '123456789012'},
+                'State': {'S': 'running'},
+                'Tags': {'M': {'SomeTag': {'S': 'Value'}}}  # no platform tag
+            }
+        }
     }
+    processor.process_stream_record(record)
+    mock_take_action.assert_not_called()
 
-    # Call your process_record function with the first record
-    record = dynamodb_stream_event['Records'][0]
-    stream_processor_lambda.process_record(record)
-
-    # Assert EC2 start_instances called for the stopped instance
-    mock_ec2.start_instances.assert_called_once_with(InstanceIds=['i-1234567890abcdef0'])
-
-@patch('stream_processor_lambda.boto3.client')
-@patch('stream_processor_lambda.assume_role')
-@patch('stream_processor_lambda.should_start_stop')
-def test_process_record_stops_instance(mock_should_start_stop, mock_assume_role, mock_boto_client, dynamodb_stream_event):
-    # Mock schedule evaluation to say "should stop"
-    mock_should_start_stop.return_value = (False, True)  # start=False, stop=True
-
-    # Mock assume_role to return a fake EC2 client
+@freeze_time("2025-06-21 21:00:00", tz_offset=0)  # 9 PM UTC, after office hours
+@patch('stream_processor_lambda.table')
+def test_stop_instance_after_office_hours_on_scheduler_recheck(mock_table):
     mock_ec2 = MagicMock()
-    mock_assume_role.return_value = mock_ec2
 
-    # Mock describe_instances to say instance is running
-    mock_ec2.describe_instances.return_value = {
-        'Reservations': [{'Instances': [{'State': {'Name': 'running'}}]}]
-    }
+    ddb_item = get_mock_ddb(last_updated_minutes_ago=10)  # last updated 10 mins ago (not recent)
 
-    # Call your process_record function with the first record
-    record = dynamodb_stream_event['Records'][0]
-    stream_processor_lambda.process_record(record)
+    # Call take_instance_action simulating the scheduler re-check
+    processor.take_instance_action(
+        ec2_client=mock_ec2,
+        instance_id=ddb_item['InstanceId'],
+        tags=ddb_item['Tags'],
+        current_state=ddb_item['State'],
+        ddb_item=ddb_item
+    )
 
-    # Assert EC2 stop_instances called for the running instance
-    mock_ec2.stop_instances.assert_called_once_with(InstanceIds=['i-1234567890abcdef0'])
-
-@patch('stream_processor_lambda.process_record')
-def test_lambda_handler_calls_process_record(mock_process_record, dynamodb_stream_event):
-    # Call lambda_handler with the stream event
-    stream_processor_lambda.lambda_handler(dynamodb_stream_event, None)
-
-    # Assert process_record was called once per record
-    assert mock_process_record.call_count == len(dynamodb_stream_event['Records'])
-
-def test_lambda_handler_empty_records():
-    event = {"Records": []}
-    result = stream_processor_lambda.lambda_handler(event, None)
-    assert result is None  # or whatever your lambda returns for empty events
+    # Assert stop_instances was called once, because instance is running after stop time
+    mock_ec2.stop_instances.assert_called_once_with(InstanceIds=[ddb_item['InstanceId']])
+    mock_ec2.start_instances.assert_not_called()

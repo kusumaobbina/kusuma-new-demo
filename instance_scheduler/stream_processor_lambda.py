@@ -2,8 +2,7 @@ import json
 import os
 import logging
 import boto3
-from datetime import datetime, timezone
-from boto3.dynamodb.conditions import Key
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -11,9 +10,9 @@ logger.setLevel(logging.INFO)
 dynamodb = boto3.resource('dynamodb')
 table_name = os.environ['DDB_TABLE_NAME']
 table = dynamodb.Table(table_name)
-
 org_member_role_name = os.environ['ORG_MEMBER_ROLE_NAME']
-
+sqs = boto3.client('sqs')
+dlq_url = os.environ.get('STREAM_PROCESSOR_DLQ_URL')
 
 def assume_role(account_id, role_name):
     sts = boto3.client('sts')
@@ -42,69 +41,102 @@ def parse_time_str(tstr):
     except Exception:
         return None
 
+
+def time_in_range(target_time, now_time, window_minutes=5, overnight_end=None):
+    """
+    Returns True if now_time is within ±window_minutes of target_time.
+    Handles overnight windows if overnight_end time is provided.
+    """
+    delta = timedelta(minutes=window_minutes)
+    target_dt = datetime.combine(datetime.today(), target_time)
+    now_dt = datetime.combine(datetime.today(), now_time)
+    
+    if overnight_end and target_time > overnight_end:
+        # Overnight window, check if now_time is after target_time or before overnight_end
+        if now_time >= target_time or now_time <= overnight_end:
+            # Adjust now_dt if before overnight_end (next day)
+            if now_time <= overnight_end:
+                now_dt += timedelta(days=1)
+            diff = abs((now_dt - target_dt).total_seconds())
+            return diff <= delta.total_seconds()
+        return False
+    else:
+        diff = abs((now_dt - target_dt).total_seconds())
+        return diff <= delta.total_seconds()
+
+
 def take_instance_action(ec2_client, instance_id, tags, current_state, ddb_item):
     now_time = datetime.utcnow().time()
     timestamp_now = datetime.now(timezone.utc).isoformat()
-    
+
     auto_start_str = tags.get('AutoStart')
     auto_stop_str = tags.get('AutoStop')
-    last_updated = ddb_item.get('LastUpdated', '')  # or LastActionTime if you want
-    
+    last_updated = ddb_item.get('LastUpdated', '')
+
     def is_recent_action():
         if not last_updated:
             return False
         try:
             last_time = datetime.fromisoformat(last_updated)
             delta = datetime.now(timezone.utc) - last_time
-            return delta.total_seconds() < 60  # avoid repeat within 60 seconds
+            return delta.total_seconds() < 300  # 5 minutes window to prevent repeats
         except Exception:
             return False
-    
+
     auto_start = parse_time_str(auto_start_str)
     auto_stop = parse_time_str(auto_stop_str)
 
     if not auto_start or not auto_stop:
         logger.warning(f"[{instance_id}] Invalid AutoStart or AutoStop tags: {auto_start_str}, {auto_stop_str}")
         return
-    
-    try:
-        # Define allowed running window
-        if auto_start < auto_stop:
-            # Normal case: office hours e.g. 08:00 to 20:00
-            within_office_hours = auto_start <= now_time < auto_stop
-        else:
-            # Edge case: overnight e.g. 20:00 to 06:00
-            within_office_hours = now_time >= auto_start or now_time < auto_stop
 
-        if within_office_hours and current_state != 'running' and not is_recent_action():
-            logger.info(f"[{instance_id}] Starting instance during office hours at {now_time}")
-            ec2_client.start_instances(InstanceIds=[instance_id])
-            table.update_item(
-                Key={'InstanceId': instance_id},
-                UpdateExpression="SET #s = :state, LastUpdated = :updated",
-                ExpressionAttributeNames={"#s": "State"},
-                ExpressionAttributeValues={
-                    ":state": "pending",
-                    ":updated": timestamp_now
-                }
-            )
-        elif not within_office_hours and current_state == 'running' and not is_recent_action():
-            logger.info(f"[{instance_id}] Stopping instance outside office hours at {now_time}")
-            ec2_client.stop_instances(InstanceIds=[instance_id])
-            table.update_item(
-                Key={'InstanceId': instance_id},
-                UpdateExpression="SET #s = :state, LastUpdated = :updated",
-                ExpressionAttributeNames={"#s": "State"},
-                ExpressionAttributeValues={
-                    ":state": "stopping",
-                    ":updated": timestamp_now
-                }
-            )
+    try:
+        # Start instance only within ±5 mins of AutoStart time
+        if time_in_range(auto_start, now_time):
+            if current_state != 'running' and not is_recent_action():
+                logger.info(f"[{instance_id}] Starting instance at AutoStart time {now_time}")
+                ec2_client.start_instances(InstanceIds=[instance_id])
+                table.update_item(
+                    Key={'InstanceId': instance_id},
+                    UpdateExpression="SET #s = :state, LastUpdated = :updated",
+                    ExpressionAttributeNames={"#s": "State"},
+                    ExpressionAttributeValues={
+                        ":state": "pending",
+                        ":updated": timestamp_now
+                    }
+                )
+            else:
+                logger.info(f"[{instance_id}] No start action needed at AutoStart time. State: {current_state}")
+
         else:
-            logger.info(f"[{instance_id}] No action needed at {now_time}. State: {current_state}")
+            # Determine if current time is outside office hours
+            if auto_start < auto_stop:
+                # Normal office hours window (e.g., 06:00 - 20:00)
+                outside_office_hours = now_time >= auto_stop or now_time < auto_start
+            else:
+                # Overnight office hours window (e.g., 20:00 - 06:00)
+                outside_office_hours = auto_stop <= now_time < auto_start
+
+            if outside_office_hours:
+                if current_state == 'running' and not is_recent_action():
+                    logger.info(f"[{instance_id}] Stopping instance outside office hours at {now_time}")
+                    ec2_client.stop_instances(InstanceIds=[instance_id])
+                    table.update_item(
+                        Key={'InstanceId': instance_id},
+                        UpdateExpression="SET #s = :state, LastUpdated = :updated",
+                        ExpressionAttributeNames={"#s": "State"},
+                        ExpressionAttributeValues={
+                            ":state": "stopping",
+                            ":updated": timestamp_now
+                        }
+                    )
+                else:
+                    logger.info(f"[{instance_id}] No stop action needed outside office hours. State: {current_state}")
+            else:
+                logger.info(f"[{instance_id}] Within office hours, no stop action needed. State: {current_state}")
+
     except Exception as e:
         logger.error(f"Failed to take action on instance {instance_id}: {e}")
-
 
 def parse_tags(tag_field):
     tags = {}
@@ -186,6 +218,26 @@ def process_all_instances():
     except Exception as e:
         logger.error(f"Error processing all instances during scheduled run: {e}")
 
+def send_to_dlq(failed_event, error_message):
+    if not dlq_url:
+        logger.error("DLQ URL not configured, cannot send failed event")
+        return
+
+    message_body = {
+        'failed_event': failed_event,
+        'error': error_message,
+        'timestamp': datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        sqs.send_message(
+            QueueUrl=dlq_url,
+            MessageBody=json.dumps(message_body)
+        )
+        logger.info("Sent failed event to DLQ")
+    except Exception as e:
+        logger.error(f"Failed to send event to DLQ: {e}")
+
 
 def lambda_handler(event, context):
     logger.info(f"Received event: {json.dumps(event)}")
@@ -193,9 +245,18 @@ def lambda_handler(event, context):
     # EventBridge Scheduled Trigger
     if event.get("source") == "aws.events" and event.get("detail-type") == "Scheduled Event":
         logger.info("Processing EventBridge scheduled check.")
-        process_all_instances()
+        try:
+            process_all_instances()
+        except Exception as e:
+            logger.error(f"Error in process_all_instances: {e}")
+            send_to_dlq(event, str(e))
         return
 
     # DynamoDB Stream Events
     for record in event.get('Records', []):
-        process_stream_record(record)
+        try:
+            process_stream_record(record)
+        except Exception as e:
+            logger.error(f"Error processing record {record}: {e}")
+            send_to_dlq(record, str(e))
+

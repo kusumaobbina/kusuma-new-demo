@@ -234,6 +234,7 @@ Resources:
           ORG_MEMBER_ROLE_NAME: EC2SchedulerRole
           SQS_QUEUE_URL: !Ref InstanceSchedulerQueue
           EVENT_BUS_NAME: !Ref CentralEventBus
+          INSTANCE_SCHEDULER_DLQ_URL : !Ref InstanceSchedulerDLQ
       Timeout: 30
       DeadLetterConfig:
         TargetArn: !GetAtt InstanceSchedulerDLQ.Arn
@@ -251,6 +252,10 @@ Resources:
       Environment:
         Variables:
           DDB_TABLE_NAME: !Ref InstanceSchedulerTable
+          ORG_MEMBER_ROLE_NAME: EC2SchedulerRole
+          SQS_QUEUE_URL: !Ref InstanceSchedulerQueue
+          EVENT_BUS_NAME: !Ref CentralEventBus
+          STREAM_PROCESSOR_DLQ_URL : !Ref StreamProcessorDLQ
       Timeout: 30
       DeadLetterConfig:
         TargetArn: !GetAtt StreamProcessorDLQ.Arn

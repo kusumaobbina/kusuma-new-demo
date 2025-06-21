@@ -12,6 +12,7 @@ table_name = os.environ['DDB_TABLE_NAME']
 org_member_role_name = os.environ['ORG_MEMBER_ROLE_NAME']
 sqs_queue_url = os.environ['SQS_QUEUE_URL']
 event_bus_name = os.environ['EVENT_BUS_NAME']
+dlq_url = os.environ.get('INSTANCE_SCHEDULER_DLQ_URL')
 
 dynamodb = boto3.resource('dynamodb')
 table = dynamodb.Table(table_name)
@@ -192,7 +193,7 @@ def handle_sqs_event(record):
         body = json.loads(record['body'])
         message = json.loads(body['Message']) if 'Message' in body else body
         logger.info(f"Handling message: {json.dumps(message)}")
-
+        
         detail_type = message.get('detail-type')
 
         if detail_type == 'EC2 Instance State-change Notification':
@@ -208,15 +209,41 @@ def handle_sqs_event(record):
 
     except Exception as e:
         logger.error(f"Failed to process SQS record: {e}")
-        raise
+        send_to_dlq(record, str(e))
+        
+
+def send_to_dlq(message_body, error_message):
+    try:
+        dlq_message = {
+            'failed_message': message_body,
+            'error': error_message,
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        sqs.send_message(
+            QueueUrl=sqs_queue_url,
+            MessageBody=json.dumps(dlq_message)
+        )
+        logger.info("Sent failed message to DLQ queue")
+    except Exception as e:
+        logger.error(f"Failed to send message to DLQ queue: {e}")
+
 
 def lambda_handler(event, context):
     logger.info(f"Event: {json.dumps(event)}")
 
     if 'Records' in event:
         for record in event['Records']:
-            handle_sqs_event(record)
+            try:
+                logger.info(f"Processing record from DLQ: {record['body']}")
+                handle_sqs_event(record)
+            except Exception as e:
+                logger.error(f"Unhandled error processing record: {e}")
+                send_to_dlq(record, str(e))
 
     elif event.get('source') == 'aws.events':
         logger.info("Scheduled tagging/state checking event triggered")
-        refresh_stale_tag_data()
+        try:
+            refresh_stale_tag_data()
+        except Exception as e:
+            logger.error(f"Error in scheduled refresh: {e}")
+            send_to_dlq(event, str(e))

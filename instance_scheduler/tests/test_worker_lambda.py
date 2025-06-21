@@ -1,118 +1,136 @@
-import os
 import json
 import pytest
-import boto3
-from moto import mock_dynamodb, mock_sts, mock_sqs, mock_events
+import os
 from unittest.mock import patch, MagicMock
 
-# Set environment variables used by worker_lambda
-os.environ['DDB_TABLE_NAME'] = 'InstanceSchedulerTable'
+
+# Patch environment variables
+os.environ['DDB_TABLE_NAME'] = 'TestTable'
 os.environ['ORG_MEMBER_ROLE_NAME'] = 'EC2SchedulerRole'
-os.environ['SQS_QUEUE_URL'] = 'https://sqs.mock.amazonaws.com/123456789012/InstanceSchedulerQueue'
+os.environ['SQS_QUEUE_URL'] = 'https://sqs.eu-west-1.amazonaws.com/123456789012/InstanceSchedulerQueue'
 os.environ['EVENT_BUS_NAME'] = 'InstanceSchedulerCentralBus'
 
-import worker_lambda  # import after env vars set
+import worker_lambda as scheduler
 
-
-@pytest.fixture(scope='function')
-def dynamodb_table():
-    with mock_dynamodb():
-        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-        table = dynamodb.create_table(
-            TableName=os.environ['DDB_TABLE_NAME'],
-            KeySchema=[{'AttributeName': 'InstanceId', 'KeyType': 'HASH'}],
-            AttributeDefinitions=[{'AttributeName': 'InstanceId', 'AttributeType': 'S'}],
-            BillingMode='PAY_PER_REQUEST'
-        )
-        table.wait_until_exists()
-        yield table
-
-
-@pytest.fixture(autouse=True)
-def mock_sts_sqs_events():
-    with mock_sts(), mock_sqs(), mock_events():
-        yield
-
-
-def boto3_client_side_effect(service_name, *args, **kwargs):
-    if service_name == 'dynamodb':
-        # Return a client connected to moto's mocked dynamodb in us-east-1
-        return boto3.client('dynamodb', region_name='us-east-1')
-    elif service_name == 'ec2':
-        mock_ec2_client = MagicMock()
-        mock_ec2_client.describe_tags.return_value = {
-            'Tags': [{'Key': 'Schedule', 'Value': 'start=08:00;stop=20:00'}]
-        }
-        mock_ec2_client.describe_instances.return_value = {
-            'Reservations': [{
-                'Instances': [{
-                    'InstanceId': 'i-1234567890abcdef0',
-                    'State': {'Name': 'stopped'}
-                }]
+@pytest.fixture
+def ec2_mock():
+    mock_client = MagicMock()
+    mock_client.describe_tags.return_value = {
+        'Tags': [
+            {'Key': 'Name', 'Value': 'test-instance'}
+        ]
+    }
+    mock_client.describe_instances.return_value = {
+        'Reservations': [{
+            'Instances': [{
+                'State': {'Name': 'running'}
             }]
+        }]
+    }
+    yield mock_client
+
+@patch('worker_lambda.sts.assume_role')
+@patch('worker_lambda.boto3.client')
+def test_assume_role_success(mock_boto_client, mock_assume_role):
+    mock_assume_role.return_value = {
+        'Credentials': {
+            'AccessKeyId': 'test',
+            'SecretAccessKey': 'test',
+            'SessionToken': 'test'
         }
-        mock_ec2_client.start_instances.return_value = {}
-        mock_ec2_client.stop_instances.return_value = {}
-        mock_ec2_client.create_tags.return_value = {}
-        return mock_ec2_client
-    elif service_name == 'sts':
-        return boto3.client('sts', region_name='us-east-1')
-    else:
-        return boto3.client(service_name, *args, **kwargs)
+    }
+    mock_boto_client.return_value = MagicMock()
+    ec2_client = scheduler.assume_role("123456789012", "EC2SchedulerRole")
+    assert ec2_client is not None
 
+def test_normalize_tags():
+    tags = {'Name': 'AppServer', 'AutoStop': '20:00'}
+    norm = scheduler.normalize_tags(tags)
+    assert norm == {'Name': 'AppServer', 'AutoStop': '20:00'}
 
-@patch('worker_lambda.boto3.client', side_effect=boto3_client_side_effect)
-def test_handle_sqs_event_and_put_dynamodb(mock_boto_client, dynamodb_table):
-    # Sample SQS event with EC2 state change message
-    event = {
-        'Records': [{
-            'body': json.dumps({
-                'Message': json.dumps({
-                    'detail-type': 'EC2 Instance State-change Notification',
-                    'detail': {
-                        'instance-id': 'i-1234567890abcdef0',
-                        'account': '123456789012'
-                    }
-                })
-            })
-        }]
+@patch('worker_lambda.assume_role')
+@patch('worker_lambda.fetch_instance_tags')
+@patch('worker_lambda.table')
+def test_handle_instance_state_change(mock_table, mock_fetch_tags, mock_assume_role, ec2_mock):
+    mock_assume_role.return_value = ec2_mock
+    mock_fetch_tags.return_value = {
+        'Name': 'app-server'
     }
 
-    # Call the lambda handler
-    worker_lambda.lambda_handler(event, None)
+    message = {
+        'detail': {
+            'instance-id': 'i-abc123',
+            'state': 'running'
+        },
+        'account': '123456789012'
+    }
 
-    # Verify the item was inserted into DynamoDB
-    response = dynamodb_table.get_item(Key={'InstanceId': 'i-1234567890abcdef0'})
-    assert 'Item' in response
-    item = response['Item']
-    assert item['InstanceId'] == 'i-1234567890abcdef0'
-    assert item['AccountId'] == '123456789012'
-    assert 'Tags' in item
-    assert item['Tags']['Schedule'] == 'start=08:00;stop=20:00'
+    scheduler.handle_instance_state_change(message)
 
+    mock_table.put_item.assert_called()
+    args = mock_table.put_item.call_args[1]
+    assert args['Item']['InstanceId'] == 'i-abc123'
+    assert 'Tags' in args['Item']
+    assert args['Item']['State'] == 'running'
 
-def test_lambda_handler_logs_missing_data(caplog):
-    # Event missing instance-id/account to test warnings
-    event = {
-        'Records': [{
-            'body': json.dumps({
-                'Message': json.dumps({
-                    'detail-type': 'EC2 Instance State-change Notification',
-                    'detail': {}
-                })
-            })
+@patch('worker_lambda.assume_role')
+@patch('worker_lambda.fetch_instance_tags')
+@patch('worker_lambda.table')
+def test_handle_tag_change_event(mock_table, mock_fetch_tags, mock_assume_role, ec2_mock):
+    mock_assume_role.return_value = ec2_mock
+    mock_fetch_tags.return_value = {'Env': 'dev'}
+
+    message = {
+        'detail': {
+            'resource-id': 'i-abc456'
+        },
+        'account': '123456789012'
+    }
+
+    scheduler.handle_tag_change_event(message)
+    mock_table.put_item.assert_called()
+    args = mock_table.put_item.call_args[1]
+    assert args['Item']['InstanceId'] == 'i-abc456'
+    assert 'Env' in args['Item']['Tags']
+
+@patch('worker_lambda.assume_role')
+@patch('worker_lambda.table.scan')
+@patch('worker_lambda.fetch_instance_tags')
+def test_refresh_stale_tag_data(mock_fetch_tags, mock_scan, mock_assume_role, ec2_mock):
+    mock_scan.return_value = {
+        'Items': [{
+            'InstanceId': 'i-xyz789',
+            'AccountId': '123456789012',
+            'Tags': {'Name': 'old'},
+            'State': 'stopped'
         }]
     }
-    with caplog.at_level('WARNING'):
-        worker_lambda.lambda_handler(event, None)
-        assert 'Missing instance-id or account-id' in caplog.text
+    mock_assume_role.return_value = ec2_mock
+    mock_fetch_tags.return_value = {'Name': 'test-instance'}
 
+    with patch.object(scheduler.table, 'update_item') as mock_update:
+        scheduler.refresh_stale_tag_data()
+        mock_update.assert_called()
 
-@patch('worker_lambda.put_event_to_bus')
-def test_scheduled_tagging_invocation(mock_put_event):
-    # Test eventbridge scheduled event triggers tagging logic
-    event = {'source': 'aws.events'}
+@patch('worker_lambda.handle_instance_state_change')
+@patch('worker_lambda.handle_tag_change_event')
+def test_handle_sqs_event(mock_tag_handler, mock_state_handler):
+    event = {
+        'body': json.dumps({
+            'detail-type': 'EC2 Instance State-change Notification',
+            'detail': {
+                'instance-id': 'i-abc123'
+            },
+            'account': '123456789012'
+        })
+    }
+    scheduler.handle_sqs_event(event)
+    mock_state_handler.assert_called_once()
 
-    worker_lambda.lambda_handler(event, None)
-    mock_put_event.assert_called()
+def test_lambda_handler_scheduled(monkeypatch):
+    monkeypatch.setenv('AWS_EXECUTION_ENV', 'AWS_Lambda_python3.9')
 
+    with patch('worker_lambda.refresh_stale_tag_data') as mock_refresh:
+        event = {'source': 'aws.events'}
+        scheduler.lambda_handler(event, None)
+        mock_refresh.assert_called_once()
