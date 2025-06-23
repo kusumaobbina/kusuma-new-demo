@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IAM Role to allow EC2 instance tagging from central account
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: The Account ID of the central/management account that runs the Step Function
+
+Resources:
+  OrgEC2TaggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: OrgEC2TaggingRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${CentralAccountId}:role/EC2TaggingStepFunctionRole
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: AllowEC2Tagging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:CreateTags
+                Resource: "*"
+
+Outputs:
+  RoleName:
+    Description: Name of the IAM Role created
+    Value: !Ref OrgEC2TaggingRole
+
+  RoleArn:
+    Description: ARN of the IAM Role to assume from central account
+    Value: !GetAtt OrgEC2TaggingRole.Arn

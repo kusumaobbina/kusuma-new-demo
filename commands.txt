@@ -56,3 +56,62 @@
    56  git merge --continue
    57  git log --oneline
    58  history > commands.txt
+
+
+aws cloudformation deploy \
+  --template-file cfn.yml \
+  --stack-name EC2InstanceScheduler \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+      LambdaS3Bucket=kusuma-instance-scheduler \
+      LambdaS3Key=instance-scheduler/function.zip
+
+
+
+aws cloudformation create-stack-set \
+  --stack-set-name ForwardEC2EventsStackSet \
+  --template-body file://stackset.yml \
+  --permission-model SERVICE_MANAGED \
+  --parameters ParameterKey=CentralAccountId,ParameterValue=051826704269 ParameterKey=CentralEventBusArn,ParameterValue=arn:aws:events:eu-west-1:051826704269:event-bus/InstanceSchedulerCentralBus\
+  --capabilities CAPABILITY_NAMED_IAM \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false
+
+
+
+aws cloudformation create-stack-instances \
+  --stack-set-name ForwardEC2EventsStackSet \
+  --deployment-targets OrganizationalUnitIds=ou-m23i-wafn3pqo \
+  --regions eu-west-1
+
+
+aws cloudformation deploy \
+  --template-file cfn.yml \
+  --stack-name EC2Instancetagging \
+  --capabilities CAPABILITY_NAMED_IAM 
+
+
+aws cloudformation create-stack-set \
+  --stack-set-name OrgEC2TaggingRoleStackSet \
+  --template-body file://stackset.yml \
+  --parameters ParameterKey=CentralAccountId,ParameterValue=051826704269 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --permission-model SERVICE_MANAGED \
+  --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false \
+  --region eu-west-1
+
+aws cloudformation create-stack-instances \
+  --stack-set-name OrgEC2TaggingRoleStackSet \
+  --deployment-targets OrganizationalUnitIds=ou-m23i-wafn3pqo \
+  --regions eu-west-1
+
+  aws cloudformation update-stack-set \
+  --stack-set-name OrgEC2TaggingRoleStackSet \
+  --template-body file://stackset.yml \
+  --parameters ParameterKey=CentralAccountId,ParameterValue=051826704269 \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region eu-west-1
+
+aws cloudformation update-stack-instances \
+  --stack-set-name OrgEC2TaggingRoleStackSet \
+  --deployment-targets OrganizationalUnitIds=ou-m23i-wafn3pqo \
+  --regions eu-west-1

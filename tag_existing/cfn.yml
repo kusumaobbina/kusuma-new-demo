@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Step Function to tag EC2 instances in all AWS Organization accounts
+
+Resources:
+
+  ListAccountsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ListAccountsLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          def handler(event, context):
+              client = boto3.client('organizations')
+              accounts = []
+              paginator = client.get_paginator('list_accounts')
+              for page in paginator.paginate():
+                  for acct in page['Accounts']:
+                      if acct['Status'] == 'ACTIVE':
+                          accounts.append({'Id': acct['Id']})
+              return {'accounts': accounts}
+
+  TagInstancesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TagInstancesLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          CENTRAL_ACCOUNT_ID = "051826704269" 
+          def assume_role(account_id, role_name):
+              sts = boto3.client('sts')
+              role_arn = f'arn:aws:iam::{account_id}:role/{role_name}'
+              creds = sts.assume_role(RoleArn=role_arn, RoleSessionName='TagEC2')['Credentials']
+              return boto3.Session(
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken']
+              )
+
+          def handler(event, context):
+              for account in event['accounts']:
+                  if account['Id'] == CENTRAL_ACCOUNT_ID:
+                      continue  # skip the management account
+                  session = assume_role(account['Id'], 'OrgEC2TaggingRole')
+                  ec2_regions = [r['RegionName'] for r in session.client('ec2').describe_regions()['Regions']]
+                  for region in ec2_regions:
+                      ec2 = session.client('ec2', region_name=region)
+                      reservations = ec2.describe_instances()
+                      for res in reservations['Reservations']:
+                          for inst in res['Instances']:
+                              inst_id = inst['InstanceId']
+                              tags = inst.get('Tags', [])
+                              if any(tag['Key'] == 'Environment' and tag['Value'] == 'dev' for tag in tags):
+                                  ec2.create_tags(Resources=[inst_id], Tags=[{'Key': 'AutoStop', 'Value': 'true'}])
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EC2TaggingStepFunctionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowOrgAndEC2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:CreateTags
+                  - sts:AssumeRole
+                  - lambda:InvokeFunction
+                Resource: "*"
+
+  TagStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt LambdaExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Step Function to tag EC2 dev instances in all org accounts",
+          "StartAt": "ListAccounts",
+          "States": {
+            "ListAccounts": {
+              "Type": "Task",
+              "Resource": "${ListAccountsLambda.Arn}",
+              "Next": "TagInstances"
+            },
+            "TagInstances": {
+              "Type": "Task",
+              "Resource": "${TagInstancesLambda.Arn}",
+              "End": true
+            }
+          }
+        }
