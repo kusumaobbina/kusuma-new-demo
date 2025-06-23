@@ -1,0 +1,42 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  StackSet to deploy Cross-Account IAM Role FinOpsCrossAccountRole
+  allowing centralized Lambda to assume role in member accounts.
+
+Parameters:
+  CentralAccountId:
+    Type: String
+    Description: AWS Account ID of the central (management) account where Lambda runs
+
+Resources:
+
+  FinOpsCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FinOpsCrossAccountRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${CentralAccountId}:role/FinOpsLambdaExecutionRole
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FinOpsCrossAccountPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstanceTypes
+                  - ec2:DescribeInstances
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudtrail:LookupEvents
+                  - organizations:ListAccounts
+                Resource: "*"
+
+Outputs:
+  RoleArn:
+    Description: ARN of the FinOpsCrossAccountRole
+    Value: !GetAtt FinOpsCrossAccountRole.Arn
