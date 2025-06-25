@@ -1,0 +1,821 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FinOps EC2 Cost & Utilization Collector - CSV Output with Step Functions and SQS queue orchestration
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: S3 Bucket for storing FinOps data
+
+  OrgUnitId:
+    Type: String
+    Description: AWS Organizations OU ID to process accounts from
+
+Resources:
+
+  FinOpsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FinOpsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: finops-dlq        
+
+  AccountQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: finops-account-queue
+      VisibilityTimeout: 900  # Match or exceed Lambda timeout here
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FinOpsDLQ.Arn
+        maxReceiveCount: 5
+
+  InstanceQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: finops-instance-queue
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FinOpsDLQ.Arn
+        maxReceiveCount: 5
+
+  MetricsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: finops-metrics-queue
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt FinOpsDLQ.Arn
+        maxReceiveCount: 5
+
+
+  # Lambda Event Source Mappings
+  ProcessInstancesEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt AccountQueue.Arn
+      FunctionName: !GetAtt ProcessInstancesLambda.Arn
+      Enabled: True
+
+  ProcessMetricsInstanceQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt InstanceQueue.Arn
+      FunctionName: !GetAtt ProcessMetricsLambda.Arn
+      Enabled: True
+
+  ProcessMetricsMetricsQueueEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt MetricsQueue.Arn
+      FunctionName: !GetAtt ProcessMetricsLambda.Arn
+      Enabled: True
+
+
+  # IAM Role for Lambdas
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: finops-lambda-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: finops-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${S3BucketName}
+                  - !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt AccountQueue.Arn
+                  - !GetAtt InstanceQueue.Arn
+                  - !GetAtt MetricsQueue.Arn
+                  - !GetAtt FinOpsDLQ.Arn
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccountsForParent
+                  - organizations:DescribeAccount
+                  - organizations:ListTagsForResource
+                  - sts:AssumeRole
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceTypes
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudtrail:LookupEvents
+                  - ce:GetCostAndUsage
+                  - pricing:GetProducts
+                Resource: '*'
+
+  # Lambda 1: GatherCostLambda
+  GatherCostLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: gather-cost-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import datetime
+          import csv
+          import io
+          import os
+          import json
+
+          ce = boto3.client('ce')
+          s3 = boto3.client('s3')
+          pricing = boto3.client('pricing', region_name='us-east-1')  # Pricing API only in us-east-1
+
+          def parse_price_from_response(response):
+              # Extract the on-demand price per hour from the Pricing API response
+              # The response can have multiple products, we pick the first one
+              try:
+                  price_list = response['PriceList']
+                  if not price_list:
+                      return None
+                  price_item = json.loads(price_list[0])
+
+                  terms = price_item.get('terms', {})
+                  ondemand_terms = terms.get('OnDemand', {})
+                  for term_id, term in ondemand_terms.items():
+                      price_dimensions = term.get('priceDimensions', {})
+                      for dim_id, dim in price_dimensions.items():
+                          price_per_unit = dim.get('pricePerUnit', {}).get('USD')
+                          if price_per_unit:
+                              return float(price_per_unit)
+              except Exception as e:
+                  print(f"Error parsing pricing response: {e}")
+              return None
+
+          def get_on_demand_price(instance_type, region_code='EU'):
+              filters = [
+                  {'Type': 'TERM_MATCH', 'Field': 'instanceType', 'Value': instance_type},
+                  {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': region_code},
+                  {'Type': 'TERM_MATCH', 'Field': 'operatingSystem', 'Value': 'Linux'},
+                  {'Type': 'TERM_MATCH', 'Field': 'preInstalledSw', 'Value': 'NA'},
+                  {'Type': 'TERM_MATCH', 'Field': 'tenancy', 'Value': 'Shared'},
+                  {'Type': 'TERM_MATCH', 'Field': 'capacitystatus', 'Value': 'Used'}
+              ]
+              response = pricing.get_products(ServiceCode='AmazonEC2', Filters=filters, MaxResults=1)
+              return parse_price_from_response(response)
+
+          def compare_costs(actual_cost, on_demand_price):
+              if on_demand_price is None:
+                  return "Pricing info unavailable"
+              if actual_cost > on_demand_price * 24 * 1.1:  # multiply by 24 for daily price
+                  return "High cost compared to pricing, consider reserved or spot instances."
+              elif actual_cost < on_demand_price * 24 * 0.9:
+                  return "Lower cost than standard pricing, verify billing."
+              else:
+                  return "Costs aligned with on-demand pricing."
+
+          def lambda_handler(event, context):
+              end = datetime.datetime.utcnow()
+              start = end - datetime.timedelta(days=14)
+              start_str = start.strftime('%Y-%m-%d')
+              end_str = end.strftime('%Y-%m-%d')
+
+              response = ce.get_cost_and_usage(
+                  TimePeriod={'Start': start_str, 'End': end_str},
+                  Granularity='DAILY',
+                  Metrics=['UnblendedCost'],
+                  Filter={
+                      'Dimensions': {
+                          'Key': 'SERVICE',
+                          'Values': ['Amazon Elastic Compute Cloud - Compute']
+                      }
+                  }
+              )
+
+              results = response.get('ResultsByTime', [])
+              # Prepare CSV in memory
+              output = io.StringIO()
+              writer = csv.writer(output)
+              writer.writerow(['Date', 'Service', 'UnblendedCost', 'OnDemandPricePerDay', 'CostComparison'])
+
+              # For example purposes, pick an instance type to compare pricing with
+              # You might want to extend this by mapping costs to actual instance types.
+              example_instance_type = 't3.medium'
+              on_demand_price_per_hour = get_on_demand_price(example_instance_type)
+              if on_demand_price_per_hour:
+                  on_demand_price_per_day = on_demand_price_per_hour * 24
+              else:
+                  on_demand_price_per_day = None
+
+              for day in results:
+                  date = day['TimePeriod']['Start']
+                  amount = float(day['Total']['UnblendedCost']['Amount'])
+                  service = 'Amazon Elastic Compute Cloud - Compute'
+                  comparison = compare_costs(amount, on_demand_price_per_hour)
+                  writer.writerow([date, service, amount, on_demand_price_per_day, comparison])
+
+              key = f"data/ec2_costs_{start_str}_to_{end_str}.csv"
+              s3.put_object(Bucket=os.environ['S3_BUCKET_NAME'], Key=key, Body=output.getvalue().encode('utf-8'))
+
+              return {'statusCode': 200, 'message': f"EC2 cost data stored at {key}"}
+
+
+  # Lambda 2: GatherAccountsLambda
+  GatherAccountsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: gather-accounts-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          ORG_UNIT_ID: !Ref OrgUnitId
+          ACCOUNT_QUEUE_URL: !Ref AccountQueue
+      Code:
+        ZipFile: |
+          import boto3
+          import csv
+          import io
+          import json
+          import os
+
+          org = boto3.client('organizations')
+          sqs = boto3.client('sqs')
+          s3 = boto3.client('s3')
+
+          def list_accounts_in_ou(ou_id):
+              accounts = []
+              paginator = org.get_paginator('list_accounts_for_parent')
+              for page in paginator.paginate(ParentId=ou_id):
+                  for acc in page['Accounts']:
+                      # Skip suspended accounts
+                      if acc['Status'] == 'SUSPENDED':
+                          continue
+                      tags = {}
+                      try:
+                          tags_resp = org.list_tags_for_resource(ResourceId=acc['Id'])
+                          tags = {t['Key'].lower(): t['Value'] for t in tags_resp.get('Tags', [])}
+                      except Exception:
+                          pass
+                      accounts.append({
+                          'Id': acc['Id'],
+                          'Name': acc['Name'],
+                          'Email': acc.get('Email', ''),
+                          'Status': acc['Status'],
+                          'Owner': tags.get('owner', ''),
+                          'ProjectID': tags.get('project-id', ''),
+                          'Environment': tags.get('environment', '')
+                      })
+              return accounts
+
+          def lambda_handler(event, context):
+              ou_id = os.environ['ORG_UNIT_ID']
+              accounts = list_accounts_in_ou(ou_id)
+
+              # Send each account info as message to SQS queue
+              for acc in accounts:
+                  sqs.send_message(QueueUrl=os.environ['ACCOUNT_QUEUE_URL'], MessageBody=json.dumps(acc))
+
+              # Save all accounts info as CSV in S3
+              output = io.StringIO()
+              writer = csv.writer(output)
+              writer.writerow(['Id','Name','Email','Status','Owner','ProjectID','Environment'])
+              for acc in accounts:
+                  writer.writerow([
+                      acc['Id'], acc['Name'], acc['Email'], acc['Status'], 
+                      acc['Owner'], acc['ProjectID'], acc['Environment']
+                  ])
+
+              s3.put_object(Bucket=os.environ['S3_BUCKET_NAME'], Key='accounts/accounts.csv', Body=output.getvalue().encode('utf-8'))
+
+              return {'statusCode': 200, 'message': f'{len(accounts)} accounts processed', 'accountsList': accounts}
+
+  # Lambda 3: ProcessInstancesLambda
+  ProcessInstancesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: process-instances-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          INSTANCE_QUEUE_URL: !Ref InstanceQueue
+          ROLE_NAME: FinOpsCrossAccountRole
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import csv
+          import io
+
+          sts = boto3.client('sts')
+          s3 = boto3.client('s3')
+          sqs = boto3.client('sqs')
+
+          def assume_role(account_id, role_name):
+              role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+              print(f"Assuming role: {role_arn}")
+              resp = sts.assume_role(RoleArn=role_arn, RoleSessionName="FinOpsSession")
+              creds = resp['Credentials']
+              return boto3.Session(
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken']
+              )
+
+          def get_instance_metadata(ec2, instance):
+              instance_id = instance['InstanceId']
+              instance_type = instance['InstanceType']
+              name = ''
+              if 'Tags' in instance:
+                  for tag in instance['Tags']:
+                      if tag['Key'] == 'Name':
+                          name = tag['Value']
+                          break
+
+              vcpu = None
+              try:
+                  it_info = ec2.describe_instance_types(InstanceTypes=[instance_type])
+                  vcpu = it_info['InstanceTypes'][0]['VCpuInfo']['DefaultVCpus']
+              except Exception as e:
+                  print(f"Error fetching instance type info: {e}")
+
+              platform = instance.get('Platform')
+              platform_details = instance.get('PlatformDetails')
+              os_info = platform_details if platform_details else ('Windows' if platform == 'windows' else 'Linux/UNIX')
+
+              return {
+                  "InstanceId": instance_id,
+                  "Name": name,
+                  "InstanceType": instance_type,
+                  "vCPU": vcpu,
+                  "OS": os_info,
+                  "Platform": platform
+              }
+
+          def lambda_handler(event, context):
+              role_name = os.environ['ROLE_NAME']
+              instance_queue_url = os.environ['INSTANCE_QUEUE_URL']
+              bucket_name = os.environ['S3_BUCKET_NAME']
+
+              for record in event['Records']:
+                  body = record['body']
+                  account = json.loads(body) if isinstance(body, str) else body
+                  account_id = account.get('Id')
+
+                  if not account_id:
+                      print("Missing account ID in message:", body)
+                      continue
+
+                  print(f"Processing account: {account_id}")
+
+                  try:
+                      session = assume_role(account_id, role_name)
+                      ec2 = session.client('ec2')
+                  except Exception as e:
+                      print(f"Failed to assume role for {account_id}: {e}")
+                      continue
+
+                  instances = []
+                  paginator = ec2.get_paginator('describe_instances')
+                  for page in paginator.paginate():
+                      for reservation in page.get('Reservations', []):
+                          for instance in reservation.get('Instances', []):
+                              instances.append(instance)
+
+                  # Prepare CSV for all instances of this account
+                  output = io.StringIO()
+                  writer = csv.writer(output)
+                  writer.writerow(['InstanceId', 'Name', 'InstanceType', 'vCPU', 'OS', 'Platform'])
+
+                  for inst in instances:
+                      meta = get_instance_metadata(ec2, inst)
+
+                      writer.writerow([
+                          meta['InstanceId'], meta['Name'], meta['InstanceType'],
+                          meta['vCPU'], meta['OS'], meta['Platform']
+                      ])
+
+                      # Send instance info to metrics queue
+                      try:
+                          sqs.send_message(
+                              QueueUrl=instance_queue_url,
+                              MessageBody=json.dumps({
+                                  "account_id": account_id,
+                                  "instance_id": meta['InstanceId']
+                              })
+                          )
+                          print(f"Sent instance {meta['InstanceId']} to metrics queue.")
+                      except Exception as e:
+                          print(f"Failed to enqueue instance {meta['InstanceId']}: {e}")
+
+                  s3_key = f"instances/{account_id}_Ec2_Metadata.csv"
+                  try:
+                      s3.put_object(Bucket=bucket_name, Key=s3_key, Body=output.getvalue().encode('utf-8'))
+                      print(f"Saved instance metadata CSV for account {account_id} to {s3_key}")
+                  except Exception as e:
+                      print(f"Error uploading {s3_key} to S3: {e}")
+
+              return {
+                  'statusCode': 200,
+                  'message': 'Successfully processed EC2 instances'
+              }
+
+
+  # Lambda 4: ProcessMetricsLambda
+  ProcessMetricsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: process-metrics-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          METRICS_QUEUE_URL: !Ref MetricsQueue
+          ROLE_NAME: FinOpsCrossAccountRole
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import csv
+          import io
+          from datetime import datetime, timedelta
+
+          sts = boto3.client('sts')
+          s3 = boto3.client('s3')
+
+          CPU_METRICS = {
+              "CPUUtilization": ["Average", "Maximum"],
+              "CPUCreditUsage": ["Sum", "Average"],
+              "CPUCreditBalance": ["Average"]
+          }
+
+          def assume_role(account_id, role_name):
+              role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+              resp = sts.assume_role(RoleArn=role_arn, RoleSessionName="FinOpsSession")
+              creds = resp['Credentials']
+              return boto3.Session(
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken']
+              )
+
+          def categorize_instance(avg_cpu):
+              if avg_cpu < 10:
+                  return "Very Low", "Consider downsizing or shutting down"
+              elif avg_cpu < 40:
+                  return "Low", "Monitor usage closely"
+              elif avg_cpu < 80:
+                  return "Normal", "No action needed"
+              else:
+                  return "High", "Consider upgrading instance type"
+
+          def lambda_handler(event, context):
+              message = json.loads(event['Records'][0]['body'])
+              account_id = message['account_id']
+              instance_id = message['instance_id']
+              is_terminated = message.get('is_terminated', False)
+
+              session = assume_role(account_id, os.environ['ROLE_NAME'])
+              cw = session.client('cloudwatch')
+
+              end = datetime.utcnow()
+              start = end - timedelta(days=14)
+              period = 300
+
+              metric_queries = []
+              stat_columns = []
+
+              for metric, stats in CPU_METRICS.items():
+                  for stat in stats:
+                      qid = f"id{len(metric_queries)}"
+                      stat_columns.append((qid, metric, stat))
+                      metric_queries.append({
+                          "Id": qid,
+                          "MetricStat": {
+                              "Metric": {
+                                  "Namespace": "AWS/EC2",
+                                  "MetricName": metric,
+                                  "Dimensions": [{"Name": "InstanceId", "Value": instance_id}]
+                              },
+                              "Period": period,
+                              "Stat": stat
+                          },
+                          "ReturnData": True
+                      })
+
+              metric_data = cw.get_metric_data(
+                  MetricDataQueries=metric_queries,
+                  StartTime=start,
+                  EndTime=end,
+                  ScanBy='TimestampAscending'
+              )
+
+              rows = {}
+              for (qid, metric, stat), result in zip(stat_columns, metric_data['MetricDataResults']):
+                  for ts, val in zip(result['Timestamps'], result['Values']):
+                      iso_ts = ts.isoformat()
+                      if iso_ts not in rows:
+                          rows[iso_ts] = {"Timestamp": iso_ts}
+                      rows[iso_ts][f"{metric}_{stat}"] = val
+
+              # Categorization
+              avg_vals = [row.get("CPUUtilization_Average") for row in rows.values() if "CPUUtilization_Average" in row]
+              avg_cpu = sum(avg_vals) / len(avg_vals) if avg_vals else 0.0
+              category, suggestion = categorize_instance(avg_cpu)
+
+              # Write CSV
+              output = io.StringIO()
+              fieldnames = ['Timestamp'] + [f"{m}_{s}" for m, stats in CPU_METRICS.items() for s in stats] + ['Category', 'Suggestion']
+              writer = csv.DictWriter(output, fieldnames=fieldnames)
+              writer.writeheader()
+
+              for row in sorted(rows.values(), key=lambda x: x['Timestamp']):
+                  row['Category'] = category
+                  row['Suggestion'] = suggestion
+                  writer.writerow(row)
+
+              bucket = os.environ['S3_BUCKET_NAME']
+              prefix = "metrics-terminated" if is_terminated else "metrics"
+              key = f"{prefix}/{account_id}_{instance_id}_metrics.csv"
+
+              s3.put_object(
+                  Bucket=bucket,
+                  Key=key,
+                  Body=output.getvalue().encode('utf-8')
+              )
+
+              return {
+                  "statusCode": 200,
+                  "message": f"Saved metrics for {'terminated ' if is_terminated else ''}instance {instance_id} in account {account_id}"
+              }
+
+
+  # Lambda 5: TerminatedInstancesLambda
+  TerminatedInstancesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: terminated-instances-lambda
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref S3BucketName
+          METRICS_QUEUE_URL: !Ref MetricsQueue
+          ROLE_NAME: FinOpsCrossAccountRole
+
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime, timedelta
+
+          sts = boto3.client('sts')
+          sqs = boto3.client('sqs')
+
+          def assume_role(account_id, role_name):
+              role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+              print(f"Assuming role: {role_arn}")
+              response = sts.assume_role(RoleArn=role_arn, RoleSessionName='TerminatedEC2Metrics')
+              creds = response['Credentials']
+              return boto3.Session(
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken']
+              )
+
+          def get_terminated_instances(cloudtrail, start_time, end_time):
+              paginator = cloudtrail.get_paginator('lookup_events')
+              terminated_instances = []
+
+              for page in paginator.paginate(
+                  LookupAttributes=[{'AttributeKey': 'EventName', 'AttributeValue': 'TerminateInstances'}],
+                  StartTime=start_time,
+                  EndTime=end_time
+              ):
+                  for event in page['Events']:
+                      try:
+                          event_detail = json.loads(event['CloudTrailEvent'])
+                          for instance in event_detail.get('requestParameters', {}).get('instancesSet', {}).get('items', []):
+                              terminated_instances.append({
+                                  'InstanceId': instance.get('instanceId'),
+                                  'TerminationTime': event['EventTime'].isoformat()
+                              })
+                      except Exception as e:
+                          print(f"Error parsing event: {e}")
+              return terminated_instances
+
+          def lambda_handler(event, context):
+              accounts = event.get('accountsList', [])
+              role_name = os.environ['ROLE_NAME']
+              queue_url = os.environ['METRICS_QUEUE_URL']
+
+              total_terminated = 0
+
+              for account in accounts:
+                  account_id = account.get('Id')
+                  if not account_id:
+                      print("Skipping account without Id:", account)
+                      continue
+
+                  print(f"Processing account: {account_id}")
+
+                  try:
+                      session = assume_role(account_id, role_name)
+                      ct_client = session.client('cloudtrail')
+
+                      end_time = datetime.utcnow()
+                      start_time = end_time - timedelta(days=90)
+
+                      terminated_instances = get_terminated_instances(ct_client, start_time, end_time)
+
+                      for item in terminated_instances:
+                          message = {
+                              "account_id": account_id,
+                              "instance_id": item['InstanceId'],
+                              "termination_time": item['TerminationTime'],
+                              "is_terminated": True
+                          }
+                          sqs.send_message(QueueUrl=queue_url, MessageBody=json.dumps(message))
+                          print(f"Sent terminated instance {item['InstanceId']} to queue.")
+
+                      total_terminated += len(terminated_instances)
+
+                  except Exception as e:
+                      print(f"Failed to process account {account_id}: {e}")
+
+              return {
+                  "statusCode": 200,
+                  "message": f"Processed {len(accounts)} accounts, {total_terminated} terminated instances sent to queue."
+              }
+
+
+
+  # Step Functions IAM Role
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: finops-stepfunctions-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsInvokeLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GatherCostLambda.Arn
+                  - !GetAtt GatherAccountsLambda.Arn
+                  - !GetAtt ProcessInstancesLambda.Arn
+                  - !GetAtt ProcessMetricsLambda.Arn
+                  - !GetAtt TerminatedInstancesLambda.Arn
+
+  # Step Function State Machine
+  FinOpsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString:
+        !Sub |
+          {
+            "StartAt": "GatherCost",
+            "States": {
+              "GatherCost": {
+                "Type": "Task",
+                "Resource": "${GatherCostLambda.Arn}",
+                "Next": "GatherAccounts"
+              },
+              "GatherAccounts": {
+                "Type": "Task",
+                "Resource": "${GatherAccountsLambda.Arn}",
+                "Next": "GatherTerminatedInstances"
+              },
+              "GatherTerminatedInstances": {
+                "Type": "Task",
+                "Resource": "${TerminatedInstancesLambda.Arn}",
+                "End": true
+              }
+            }
+          }
+
+
+  # IAM Role for EventBridge to trigger Step Function
+  FinOpsEventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: finops-eventbridge-stepfunctions-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowStepFunctionStart
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref FinOpsStateMachine
+
+  # EventBridge Rule to schedule Step Function every 14 days
+  FinOpsScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: finops-stepfunction-schedule
+      ScheduleExpression: 'cron(0 0 1/14 * ? *)'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref FinOpsStateMachine
+          Id: finops-stepfunction
+          RoleArn: !GetAtt FinOpsEventBridgeRole.Arn
+
+Outputs:
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref FinOpsDataBucket
+
+  AccountQueueURL:
+    Description: SQS Queue URL for account processing
+    Value: !Ref AccountQueue
+
+  InstanceQueueURL:
+    Description: SQS Queue URL for instance processing
+    Value: !Ref InstanceQueue
+
+  MetricsQueueURL:
+    Description: SQS Queue URL for metrics processing
+    Value: !Ref MetricsQueue
+
+  StepFunctionArn:
+    Description: FinOps Step Function ARN
+    Value: !Ref FinOpsStateMachine
+
+  EventBridgeRuleName:
+    Description: EventBridge Rule Name
+    Value: !Ref FinOpsScheduleRule

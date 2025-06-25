@@ -117,11 +117,11 @@ aws cloudformation update-stack-instances \
   --regions eu-west-1
 
 aws cloudformation deploy \
-  --template-file cfn.yml \
+  --template-file sqs.yml \
   --stack-name kusuma-finops-stack \
   --capabilities CAPABILITY_NAMED_IAM \
   --parameter-overrides \
-      S3BucketName=kusuma-finops-bucket
+      S3BucketName=kusuma-finops-bucket OrgUnitId=ou-m23i-wafn3pqo
 
 aws cloudformation create-stack-set \
   --stack-set-name finopsRoleStackSet \
